@@ -54,25 +54,17 @@ def ensure_table():
         conn.commit()
 
 ensure_table()
+from typing import List
+from pydantic import BaseModel
 
-@app.post("/append_log")
-def append_log(entry: LogEntry):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO decision_logs
-                  (created_at, scenario_id, player, unit, decision, justification)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    datetime.now(timezone.utc),
-                    entry.scenario_id,
-                    entry.player,
-                    entry.unit,
-                    entry.decision,
-                    entry.justification,
-                ),
-            )
-        conn.commit()
-    return {"status": "logged"}
+class DecisionEntry(BaseModel):
+    timestamp: str
+    description: str
+    ethical_score: int
+    military_score: int
+    command_score: int
+
+class DecisionLog(BaseModel):
+    player: str
+    unit: str
+    decisions: List[DecisionEntry]
