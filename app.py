@@ -17,3 +17,15 @@ def load_scenario(req: Req):
         "title": f"Scenario: {req.scenario_id}",
         "content": {"ok": True}
     }
+    
+class LogEntry(BaseModel):
+    scenario_id: str
+    user_id: str | None = None
+    decision: str
+    justification: str
+
+@app.post("/append_log")
+def append_log(entry: LogEntry):
+    # később: fájl, DB, MCP, stb.
+    print("LOG:", entry)
+    return {"status": "logged"}
