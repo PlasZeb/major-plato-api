@@ -781,6 +781,14 @@ def resolve_turn(turn: TurnRequest, request: Request):
     if persisted_state is None:
         persisted_state = json.loads(json.dumps(turn.game_state or _default_game_state(selected_id)))
     engine = _engine_state(persisted_state, selected_id)
+    if turn.turn_id and engine.get("last_turn_id") == turn.turn_id and engine.get("last_response"):
+        return {
+            "session_id": turn.session_id,
+            "scenario_id": selected_id,
+            "idempotent_replay": True,
+            **engine["last_response"]
+        }
+
     if turn.expected_turn is not None and int(persisted_state.get("turn", 1)) != turn.expected_turn:
         raise HTTPException(
             status_code=409,
@@ -790,14 +798,6 @@ def resolve_turn(turn: TurnRequest, request: Request):
                 "current_turn": persisted_state.get("turn", 1)
             }
         )
-
-    if turn.turn_id and engine.get("last_turn_id") == turn.turn_id and engine.get("last_response"):
-        return {
-            "session_id": turn.session_id,
-            "scenario_id": selected_id,
-            "idempotent_replay": True,
-            **engine["last_response"]
-        }
 
     previous_response_id = turn.previous_response_id or engine.get("response_id")
     conversation_id = turn.conversation_id or engine.get("conversation_id")
