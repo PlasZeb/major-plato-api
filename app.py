@@ -1,10 +1,23 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, Dict, List, Optional, Union
 import os, json, base64, uuid, secrets
 import requests
 
 app = FastAPI()
+
+_FRONTEND_ORIGIN = os.environ.get(
+    "MAP_FRONTEND_ORIGIN",
+    "https://major-plato-tactical-map.milanmor.chatgpt.site"
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_FRONTEND_ORIGIN],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Scenario endpoint (placeholder; your RAG can remain separate) ---
 # --- Scenario database and endpoints ---
@@ -195,10 +208,15 @@ def load_scenario(req: Req):
         "content": scenario["content"]
     }
 
-# --- Text simulation turn endpoint ---
+# --- Durable game-session and text simulation endpoints ---
+class CreateGameSessionRequest(BaseModel):
+    scenario_id: str = "random"
+    title: Optional[str] = None
+
+
 class TurnRequest(BaseModel):
     session_id: str
-    scenario_id: str
+    scenario_id: str = "random"
     player_action: Dict[str, Any]
     game_state: Dict[str, Any] = Field(default_factory=dict)
     recent_events: List[Dict[str, Any]] = Field(default_factory=list)
@@ -206,6 +224,9 @@ class TurnRequest(BaseModel):
     previous_response_id: Optional[str] = None
     conversation_id: Optional[str] = None
     map_session_id: Optional[str] = None
+    map_session_token: Optional[str] = None
+    turn_id: Optional[str] = None
+    expected_turn: Optional[int] = None
 
 
 TURN_RESPONSE_SCHEMA = {
@@ -293,7 +314,7 @@ TURN_RESPONSE_SCHEMA = {
 TURN_INSTRUCTIONS = """
 You are the authoritative text adjudicator for the Major Plato MDMP and military-ethics
 training simulation. Resolve one player turn using the supplied scenario, current game
-state, recent events, and player action.
+state, recent events, state summary, and player action.
 
 Apply MDMP reasoning and explicitly account for mission, objectives, constraints, civilian
 protection, proportionality, precaution, positive identification, cultural context, and
@@ -303,8 +324,167 @@ authorize escalation or lethal force. Do not invent capabilities or map identifi
 Return only the requested JSON schema. map_actions are proposed game actions, not proof that
 the action happened. Only use the supported map unit alpha and locations command, village,
 or bridge. If the action is unsafe, unauthorized, or unsupported, do not emit a map action;
-explain the consequence in narrative and assessment.
+explain the consequence in narrative and assessment. Never claim that a unit has arrived
+until the map service produces the corresponding event.
 """
+
+
+def _resolve_scenario(requested_id: str):
+    normalized = (requested_id or "random").strip().lower()
+    selected_id = secrets.choice(list(SCENARIOS.keys())) if normalized == "random" else normalized
+    scenario = SCENARIOS.get(selected_id)
+    if scenario is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_scenario_id",
+                "requested_id": normalized,
+                "available_ids": ["random"] + list(SCENARIOS.keys())
+            }
+        )
+    return selected_id, scenario
+
+
+def _map_settings():
+    base_url = os.environ.get("MAP_API_URL", "").rstrip("/")
+    api_key = os.environ.get("MAP_API_KEY")
+    if not base_url or not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "map_api_not_configured",
+                "required": ["MAP_API_URL", "MAP_API_KEY"]
+            }
+        )
+    return base_url, api_key
+
+
+def _map_request(
+    method: str,
+    path: str,
+    body: Optional[Dict[str, Any]] = None,
+    session_token: Optional[str] = None,
+    privileged: bool = True,
+):
+    base_url, api_key = _map_settings()
+    headers = {"Content-Type": "application/json"}
+    if privileged:
+        headers["X-Major-Plato-Key"] = api_key
+    elif session_token:
+        headers["X-Session-Token"] = session_token
+    try:
+        return requests.request(
+            method,
+            f"{base_url}{path}",
+            headers=headers,
+            json=body,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "map_api_unreachable", "message": str(exc)}
+        )
+
+
+def _response_json(response):
+    try:
+        return response.json()
+    except ValueError:
+        return {"raw": response.text[:1000]}
+
+
+def _raise_map_error(response, operation: str):
+    if response.status_code < 400:
+        return
+    if response.status_code in (401, 403, 404):
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "error": "map_api_error",
+                "operation": operation,
+                "response": _response_json(response)
+            }
+        )
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "error": "map_api_error",
+            "operation": operation,
+            "http_status": response.status_code,
+            "response": _response_json(response)
+        }
+    )
+
+
+def _map_session_state(session_id: str, session_token: Optional[str]):
+    if not session_token:
+        raise HTTPException(
+            status_code=401,
+            detail="A map session token szükséges a játékmenethez."
+        )
+    response = _map_request(
+        "GET",
+        f"/api/major-plato/sessions/{session_id}/state",
+        session_token=session_token,
+        privileged=False,
+    )
+    _raise_map_error(response, "get_session_state")
+    return _response_json(response)
+
+
+def _map_session_events(session_id: str):
+    response = _map_request(
+        "GET",
+        f"/api/major-plato/sessions/{session_id}/events",
+        privileged=True,
+    )
+    _raise_map_error(response, "get_session_events")
+    payload = _response_json(response)
+    return payload.get("events", [])
+
+
+def _default_game_state(scenario_id: str):
+    return {
+        "schema_version": "2.0",
+        "turn": 1,
+        "units": {
+            "alpha": {
+                "label": "Alpha raj",
+                "side": "friendly",
+                "status": "ready",
+                "location_id": "command",
+                "position": {"x": 170, "y": 395}
+            }
+        },
+        "last_event": None,
+        "engine": {
+            "scenario_id": scenario_id,
+            "summary": "A szcenárió betöltve; a parancsnoki döntésre vár.",
+            "response_id": None,
+            "conversation_id": None,
+            "last_turn_id": None,
+            "last_response": None,
+            "state_delta": None,
+            "updated_at": None
+        }
+    }
+
+
+def _engine_state(game_state: Dict[str, Any], scenario_id: str):
+    engine = game_state.get("engine")
+    if not isinstance(engine, dict):
+        engine = {}
+        game_state["engine"] = engine
+    engine.setdefault("scenario_id", scenario_id)
+    engine.setdefault("summary", "")
+    engine.setdefault("response_id", None)
+    engine.setdefault("conversation_id", None)
+    engine.setdefault("last_turn_id", None)
+    engine.setdefault("last_response", None)
+    engine.setdefault("state_delta", None)
+    engine.setdefault("updated_at", None)
+    return engine
 
 
 def _validate_map_actions(actions):
@@ -341,7 +521,10 @@ def _extract_openai_json(response_body):
                     chunks.append(part["text"])
         text = "".join(chunks)
     if not text:
-        raise HTTPException(status_code=502, detail="OpenAI returned no text output")
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "openai_empty_output", "response": response_body}
+        )
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
@@ -352,81 +535,113 @@ def _extract_openai_json(response_body):
 
 
 def _dispatch_map_actions(map_session_id, actions):
-    map_api_url = os.environ.get("MAP_API_URL", "").rstrip("/")
-    map_api_key = os.environ.get("MAP_API_KEY")
-    if not map_session_id:
-        return {"status": "not_dispatched", "reason": "missing_map_session_id"}
-    if not map_api_url or not map_api_key:
-        return {"status": "not_dispatched", "reason": "map_api_not_configured"}
-
+    if not actions:
+        return {"status": "not_requested", "results": []}
     results = []
-    url = f"{map_api_url}/api/major-plato/sessions/{map_session_id}/actions"
-    headers = {
-        "X-Major-Plato-Key": map_api_key,
-        "Content-Type": "application/json"
-    }
     for action in actions:
-        try:
-            response = requests.post(url, headers=headers, json=action, timeout=20)
-            if 200 <= response.status_code < 300:
-                results.append({
-                    "action": action,
-                    "status": "confirmed",
-                    "response": response.json()
-                })
-            else:
-                results.append({
-                    "action": action,
-                    "status": "rejected",
-                    "http_status": response.status_code,
-                    "response": response.text[:500]
-                })
-        except requests.RequestException as exc:
+        response = _map_request(
+            "POST",
+            f"/api/major-plato/sessions/{map_session_id}/actions",
+            body=action,
+            privileged=True,
+        )
+        if 200 <= response.status_code < 300:
+            action_status = "queued" if response.status_code == 201 else "confirmed"
             results.append({
                 "action": action,
-                "status": "error",
-                "error": str(exc)
+                "status": action_status,
+                "response": _response_json(response)
             })
-    return {"status": "completed", "results": results}
-
-
-@app.post("/turn")
-def resolve_turn(turn: TurnRequest):
-    if turn.previous_response_id and turn.conversation_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Use either previous_response_id or conversation_id, not both"
-        )
-
-    requested_id = turn.scenario_id.strip().lower()
-    if requested_id == "random":
-        selected_id = secrets.choice(list(SCENARIOS.keys()))
+        else:
+            results.append({
+                "action": action,
+                "status": "rejected",
+                "http_status": response.status_code,
+                "response": _response_json(response)
+            })
+    if any(item["status"] == "rejected" for item in results):
+        overall = "partially_rejected"
+    elif any(item["status"] == "queued" for item in results):
+        overall = "queued"
     else:
-        selected_id = requested_id
-    scenario = SCENARIOS.get(selected_id)
-    if scenario is None:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": "unknown_scenario_id",
-                "requested_id": requested_id,
-                "available_ids": ["random"] + list(SCENARIOS.keys())
-            }
-        )
+        overall = "confirmed"
+    return {"status": overall, "results": results}
 
+
+def _persist_turn_to_map(
+    map_session_id: str,
+    current_state: Dict[str, Any],
+    turn_id: str,
+    response_id: Optional[str],
+    conversation_id: Optional[str],
+    model_turn: Dict[str, Any],
+    validated_actions: List[Dict[str, Any]],
+    rejected_actions: List[Dict[str, Any]],
+    dispatch: Dict[str, Any],
+):
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+    next_state = json.loads(json.dumps(current_state))
+    next_state["schema_version"] = "2.0"
+    next_state["turn"] = int(next_state.get("turn", 1)) + 1
+    engine = _engine_state(next_state, current_state.get("engine", {}).get("scenario_id", ""))
+    response_record = {
+        "response_id": response_id,
+        "conversation_id": conversation_id,
+        "turn": model_turn,
+        "map_actions": {
+            "validated": validated_actions,
+            "rejected": rejected_actions,
+            "dispatch": dispatch
+        }
+    }
+    engine.update({
+        "summary": model_turn.get("next_state_summary", ""),
+        "response_id": response_id,
+        "conversation_id": conversation_id,
+        "last_turn_id": turn_id,
+        "last_response": response_record,
+        "state_delta": model_turn.get("state_delta"),
+        "updated_at": now
+    })
+    next_state["last_event"] = {
+        "type": "ai_turn_resolved",
+        "turn_id": turn_id,
+        "occurred_at": now
+    }
+    event_payload = {
+        "source": "text_engine",
+        "turn_id": turn_id,
+        "response_id": response_id,
+        "conversation_id": conversation_id,
+        "narrative": model_turn.get("narrative", ""),
+        "assessment": model_turn.get("assessment", {}),
+        "state_delta": model_turn.get("state_delta", {}),
+        "events": model_turn.get("events", []),
+        "map_actions": response_record["map_actions"],
+        "occurred_at": now
+    }
+    response = _map_request(
+        "POST",
+        f"/api/major-plato/sessions/{map_session_id}/events",
+        body={
+            "type": "ai_turn_resolved",
+            "payload": event_payload,
+            "state": next_state
+        },
+        privileged=True,
+    )
+    _raise_map_error(response, "persist_turn")
+    return next_state, _response_json(response)
+
+
+def _openai_response(
+    context: Dict[str, Any],
+    previous_response_id: Optional[str],
+    conversation_id: Optional[str],
+):
     openai_key = os.environ.get("OPENAI_API_KEY")
     if not openai_key:
         raise HTTPException(status_code=503, detail="OpenAI API is not configured")
-
-    context = {
-        "session_id": turn.session_id,
-        "scenario_id": selected_id,
-        "scenario": scenario,
-        "player_action": turn.player_action,
-        "game_state": turn.game_state,
-        "recent_events": turn.recent_events[-20:],
-        "state_summary": turn.state_summary
-    }
     payload = {
         "model": os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
         "instructions": TURN_INSTRUCTIONS,
@@ -441,10 +656,10 @@ def resolve_turn(turn: TurnRequest):
             }
         }
     }
-    if turn.previous_response_id:
-        payload["previous_response_id"] = turn.previous_response_id
-    elif turn.conversation_id:
-        payload["conversation"] = turn.conversation_id
+    if previous_response_id:
+        payload["previous_response_id"] = previous_response_id
+    elif conversation_id:
+        payload["conversation"] = conversation_id
 
     try:
         response = requests.post(
@@ -457,9 +672,12 @@ def resolve_turn(turn: TurnRequest):
             timeout=90
         )
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail={"error": "openai_request_failed", "message": str(exc)})
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "openai_request_failed", "message": str(exc)}
+        )
 
-    response_body = response.json()
+    response_body = _response_json(response)
     if response.status_code >= 400:
         raise HTTPException(
             status_code=502,
@@ -469,22 +687,162 @@ def resolve_turn(turn: TurnRequest):
                 "response": response_body
             }
         )
+    return response_body, _extract_openai_json(response_body)
 
-    model_turn = _extract_openai_json(response_body)
+
+@app.post("/game_sessions")
+def create_game_session(req: CreateGameSessionRequest):
+    selected_id, scenario = _resolve_scenario(req.scenario_id)
+    initial_state = _default_game_state(selected_id)
+    title = req.title.strip() if req.title else scenario["title"]
+    response = _map_request(
+        "POST",
+        "/api/major-plato/sessions",
+        body={
+            "scenario_id": selected_id,
+            "title": title,
+            "initial_state": initial_state
+        },
+        privileged=True,
+    )
+    _raise_map_error(response, "create_session")
+    created = _response_json(response)
+    return {
+        "session_id": created.get("session_id"),
+        "map_session_id": created.get("session_id"),
+        "session_token": created.get("session_token"),
+        "map_url": created.get("map_url"),
+        "created_at": created.get("created_at"),
+        "scenario_id": selected_id,
+        "title": title,
+        "scenario": scenario["content"],
+        "state": initial_state
+    }
+
+
+@app.get("/game_sessions/{session_id}")
+def get_game_session(session_id: str, request: Request):
+    token = request.headers.get("x-session-token") or request.query_params.get("token")
+    snapshot = _map_session_state(session_id, token)
+    events = _map_session_events(session_id)
+    return {**snapshot, "events": events[-100:]}
+
+
+@app.post("/turn")
+def resolve_turn(turn: TurnRequest):
+    if turn.previous_response_id and turn.conversation_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Use either previous_response_id or conversation_id, not both"
+        )
+
+    map_session_id = turn.map_session_id
+    persisted_snapshot = None
+    persisted_state = None
+    persisted_events = []
+    if map_session_id:
+        persisted_snapshot = _map_session_state(map_session_id, turn.map_session_token)
+        persisted_state = persisted_snapshot.get("state")
+        if not isinstance(persisted_state, dict):
+            raise HTTPException(status_code=502, detail="A map session állapota érvénytelen.")
+        persisted_events = _map_session_events(map_session_id)
+
+    if persisted_snapshot:
+        stored_scenario_id = persisted_snapshot.get("scenario_id")
+        requested_scenario_id = turn.scenario_id.strip().lower()
+        if requested_scenario_id == "random":
+            selected_id = stored_scenario_id
+        elif stored_scenario_id and requested_scenario_id != stored_scenario_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "scenario_mismatch",
+                    "session_scenario_id": stored_scenario_id,
+                    "requested_scenario_id": requested_scenario_id
+                }
+            )
+        else:
+            selected_id = requested_scenario_id
+        scenario = SCENARIOS.get(selected_id)
+        if scenario is None:
+            raise HTTPException(status_code=502, detail="A map session ismeretlen scenariót tartalmaz.")
+    else:
+        selected_id, scenario = _resolve_scenario(turn.scenario_id)
+
+    if persisted_state is None:
+        persisted_state = json.loads(json.dumps(turn.game_state or _default_game_state(selected_id)))
+    engine = _engine_state(persisted_state, selected_id)
+    if turn.expected_turn is not None and int(persisted_state.get("turn", 1)) != turn.expected_turn:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "turn_conflict",
+                "expected_turn": turn.expected_turn,
+                "current_turn": persisted_state.get("turn", 1)
+            }
+        )
+
+    if turn.turn_id and engine.get("last_turn_id") == turn.turn_id and engine.get("last_response"):
+        return {
+            "session_id": turn.session_id,
+            "scenario_id": selected_id,
+            "idempotent_replay": True,
+            **engine["last_response"]
+        }
+
+    previous_response_id = turn.previous_response_id or engine.get("response_id")
+    conversation_id = turn.conversation_id or engine.get("conversation_id")
+    if previous_response_id and conversation_id:
+        conversation_id = None
+
+    context = {
+        "session_id": turn.session_id,
+        "scenario_id": selected_id,
+        "scenario": scenario,
+        "player_action": turn.player_action,
+        "game_state": persisted_state,
+        "recent_events": (persisted_events[-20:] if persisted_snapshot else turn.recent_events[-20:]),
+        "state_summary": engine.get("summary") or turn.state_summary
+    }
+    response_body, model_turn = _openai_response(
+        context,
+        previous_response_id,
+        conversation_id,
+    )
     validated_actions, rejected_actions = _validate_map_actions(
         model_turn.get("map_actions", [])
     )
-    dispatch = _dispatch_map_actions(turn.map_session_id, validated_actions)
+    if map_session_id:
+        dispatch = _dispatch_map_actions(map_session_id, validated_actions)
+        actual_turn_id = turn.turn_id or str(uuid.uuid4())
+        next_state, persisted_event = _persist_turn_to_map(
+            map_session_id=map_session_id,
+            current_state=persisted_state,
+            turn_id=actual_turn_id,
+            response_id=response_body.get("id"),
+            conversation_id=(
+                (response_body.get("conversation") or {}).get("id")
+                if isinstance(response_body.get("conversation"), dict)
+                else conversation_id
+            ),
+            model_turn=model_turn,
+            validated_actions=validated_actions,
+            rejected_actions=rejected_actions,
+            dispatch=dispatch,
+        )
+    else:
+        dispatch = {"status": "not_dispatched", "reason": "no_map_session", "results": []}
+        actual_turn_id = turn.turn_id or str(uuid.uuid4())
+        next_state = persisted_state
+        persisted_event = None
 
-    return {
-        "session_id": turn.session_id,
-        "scenario_id": selected_id,
+    response_record = {
         "response_id": response_body.get("id"),
         "previous_response_id": response_body.get("id"),
         "conversation_id": (
             (response_body.get("conversation") or {}).get("id")
             if isinstance(response_body.get("conversation"), dict)
-            else turn.conversation_id
+            else conversation_id
         ),
         "turn": model_turn,
         "map_actions": {
@@ -492,6 +850,14 @@ def resolve_turn(turn: TurnRequest):
             "rejected": rejected_actions,
             "dispatch": dispatch
         }
+    }
+    return {
+        "session_id": turn.session_id,
+        "scenario_id": selected_id,
+        "turn_id": actual_turn_id,
+        "state": next_state,
+        "persisted_event": persisted_event,
+        **response_record
     }
 
 # --- Logging payload: matches your chosen schema ---
