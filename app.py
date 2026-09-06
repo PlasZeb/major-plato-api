@@ -1,28 +1,199 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Union
-import os, json, base64, uuid
+import os, json, base64, uuid, secrets
 import requests
 
 app = FastAPI()
 
 # --- Scenario endpoint (placeholder; your RAG can remain separate) ---
+# --- Scenario database and endpoints ---
+
 class Req(BaseModel):
     scenario_id: str
 
+
+SCENARIOS = {
+    "bridge_guardian": {
+        "title": "Exercise Bridge Guardian",
+        "content": {
+            "environment": "peacekeeping",
+            "operational_area": "The fictional state of Veloria",
+            "mission": (
+                "Secure the bridge connecting the command post with the village "
+                "while protecting civilians and maintaining freedom of movement."
+            ),
+            "commanders_intent": (
+                "Keep the crossing operational, prevent armed groups from gaining "
+                "control of it, and avoid unnecessary escalation."
+            ),
+            "objectives": [
+                "secure the bridge",
+                "protect the civilian population",
+                "maintain access between the command post and the village",
+                "identify armed actors before using force"
+            ],
+            "known_facts": [
+                "Civilians are still using the bridge.",
+                "An unidentified armed group has been observed near the village.",
+                "Intelligence regarding the group's intentions is incomplete.",
+                "A medical convoy is expected to approach the crossing."
+            ],
+            "constraints": [
+                "limited use of force",
+                "positive identification required",
+                "civilian protection has priority",
+                "human authorization required for escalation"
+            ],
+            "cultural_context": {
+                "description": (
+                    "The village contains a mosque and a small interfaith medical "
+                    "clinic. Local religious and community leaders have requested "
+                    "advance coordination before military searches."
+                ),
+                "training_focus": [
+                    "respect for religious practice",
+                    "cultural-property protection",
+                    "appropriate use of CIMIC and specialist advice"
+                ]
+            },
+            "autonomous_system": {
+                "type": "ISR drone",
+                "role": "reconnaissance and threat classification",
+                "limitations": [
+                    "may confuse tools or ceremonial weapons with hostile weapons",
+                    "cannot independently authorize an attack"
+                ],
+                "human_control": "human authorization required for any escalation"
+            },
+            "map": {
+                "unit_id": "alpha",
+                "initial_location_id": "command",
+                "available_location_ids": [
+                    "command",
+                    "village",
+                    "bridge"
+                ]
+            }
+        }
+    },
+
+    "village_shield": {
+        "title": "Exercise Village Shield",
+        "content": {
+            "environment": "defensive",
+            "operational_area": "The fictional region of Norland Valley",
+            "mission": (
+                "Protect the village following reports that an armed group is "
+                "moving toward the bridge."
+            ),
+            "commanders_intent": (
+                "Prevent an attack on the population without turning uncertain "
+                "intelligence into unnecessary military escalation."
+            ),
+            "objectives": [
+                "protect the village",
+                "observe and control the bridge",
+                "verify the identity and intentions of the armed group",
+                "preserve civilian access where possible"
+            ],
+            "known_facts": [
+                "Several armed persons were detected near the bridge.",
+                "Their affiliation and intentions are unknown.",
+                "Civilian vehicles remain in the area.",
+                "Communications with local authorities are intermittent."
+            ],
+            "constraints": [
+                "uncertain intelligence",
+                "civilian population present",
+                "proportionality and precaution required",
+                "no autonomous use of lethal force"
+            ],
+            "cultural_context": {
+                "description": (
+                    "The population includes several religious and ethnic "
+                    "communities. Local representatives can assist with communication."
+                ),
+                "training_focus": [
+                    "avoid stereotyping",
+                    "verify cultural information",
+                    "consult CIMIC or the chaplain when relevant"
+                ]
+            },
+            "autonomous_system": {
+                "type": "ground surveillance and classification system",
+                "role": "detect movement and classify possible threats",
+                "limitations": [
+                    "classification confidence is degraded",
+                    "civilian and armed movement patterns may overlap"
+                ],
+                "human_control": (
+                    "the commander must review ambiguous classifications and "
+                    "authorize operational responses"
+                )
+            },
+            "map": {
+                "unit_id": "alpha",
+                "initial_location_id": "command",
+                "available_location_ids": [
+                    "command",
+                    "village",
+                    "bridge"
+                ]
+            }
+        }
+    }
+}
+
+
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "scenario_count": len(SCENARIOS)
+    }
+
+
+@app.get("/scenarios")
+def list_scenarios():
+    return {
+        "scenario_ids": ["random"] + list(SCENARIOS.keys()),
+        "scenarios": [
+            {
+                "scenario_id": scenario_id,
+                "title": scenario["title"]
+            }
+            for scenario_id, scenario in SCENARIOS.items()
+        ]
+    }
+
 
 @app.post("/load_scenario")
 def load_scenario(req: Req):
-    # placeholder response; keep as-is for Actions connectivity tests
-    return {
-        "scenario_id": req.scenario_id,
-        "title": f"Scenario: {req.scenario_id}",
-        "content": {"ok": True},
-    }
+    requested_id = req.scenario_id.strip().lower()
 
+    if requested_id == "random":
+        selected_id = secrets.choice(list(SCENARIOS.keys()))
+    else:
+        selected_id = requested_id
+
+    scenario = SCENARIOS.get(selected_id)
+
+    if scenario is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_scenario_id",
+                "requested_id": requested_id,
+                "available_ids": ["random"] + list(SCENARIOS.keys())
+            }
+        )
+
+    return {
+        "scenario_id": selected_id,
+        "title": scenario["title"],
+        "content": scenario["content"]
+    }
 # --- Logging payload: matches your chosen schema ---
 DecisionRow = List[Union[str, int]]  # ["timestamp","description",ethical,military,command]
 
