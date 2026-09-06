@@ -65,6 +65,7 @@ Optional variables:
 
 - OPENAI_MODEL (default: gpt-4.1-mini)
 - MAP_FRONTEND_ORIGIN (default: https://major-plato-tactical-map.milanmor.chatgpt.site)
+- TURN_CLIENT_KEY (required only for stateless /turn calls without a map session)
 
 Example session creation:
 
