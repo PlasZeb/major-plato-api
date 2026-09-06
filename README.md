@@ -37,3 +37,60 @@ Example request:
 ```
 
 The API never stores secrets in the repository. Configure them in Render Environment Variables.
+
+
+## Durable game sessions
+
+POST /game_sessions creates a scenario-backed game session through the tactical map API. The map's D1 database stores the map state and event log; the state also contains the text engine's turn counter, summary, response ID, conversation ID, and last adjudicated turn.
+
+GET /game_sessions/{session_id} reads the durable state and event log. Supply the returned map session token as the x-session-token header or token query parameter.
+
+POST /turn resolves one graphical-game turn. In durable mode send:
+
+- session_id and map_session_id: the map session ID
+- map_session_token: the session token returned by /game_sessions
+- scenario_id: random on the first request, or the session's resolved ID
+- player_action: the player's proposed action
+- optional expected_turn and turn_id for conflict detection and retry-safe idempotency
+
+The server retrieves the persisted state and recent events, uses the stored previous response ID when present, calls the OpenAI Responses API with structured JSON output, validates map actions, queues only supported actions, and persists the adjudication result back to the map event log. A 201 map response is reported as queued, not as unit arrival; the frontend confirms arrival through the map event.
+
+Required Render environment variables:
+
+- OPENAI_API_KEY
+- MAP_API_URL=https://major-plato-tactical-map.milanmor.chatgpt.site
+- MAP_API_KEY
+
+Optional variables:
+
+- OPENAI_MODEL (default: gpt-4.1-mini)
+- MAP_FRONTEND_ORIGIN (default: https://major-plato-tactical-map.milanmor.chatgpt.site)
+
+Example session creation:
+
+```json
+POST /game_sessions
+{"scenario_id":"random"}
+```
+
+Example turn:
+
+```json
+{
+  "session_id": "map-session-id",
+  "map_session_id": "map-session-id",
+  "map_session_token": "returned-session-token",
+  "scenario_id": "random",
+  "player_action": {
+    "type": "move_unit",
+    "payload": {
+      "unit_id": "alpha",
+      "target_location_id": "bridge"
+    }
+  },
+  "expected_turn": 1,
+  "turn_id": "client-generated-id"
+}
+```
+
+Do not put OPENAI_API_KEY, MAP_API_KEY, or GitHub tokens in source control or browser code.
