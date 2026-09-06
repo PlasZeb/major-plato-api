@@ -729,7 +729,16 @@ def get_game_session(session_id: str, request: Request):
 
 
 @app.post("/turn")
-def resolve_turn(turn: TurnRequest):
+def resolve_turn(turn: TurnRequest, request: Request):
+    if not turn.map_session_id:
+        configured_client_key = os.environ.get("TURN_CLIENT_KEY")
+        supplied_client_key = request.headers.get("X-Major-Plato-Client-Key")
+        if not configured_client_key or supplied_client_key != configured_client_key:
+            raise HTTPException(
+                status_code=401,
+                detail="A /turn grafikus session tokent vagy stateless klienskulcsot igényel."
+            )
+
     if turn.previous_response_id and turn.conversation_id:
         raise HTTPException(
             status_code=400,
