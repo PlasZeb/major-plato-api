@@ -163,7 +163,8 @@ SCENARIOS = {
 def health():
     return {
         "ok": True,
-        "scenario_count": len(SCENARIOS)
+        "scenario_count": len(SCENARIOS),
+        "grid_version": "3.0"
     }
 
 
@@ -229,6 +230,11 @@ class TurnRequest(BaseModel):
     expected_turn: Optional[int] = None
 
 
+# Shared grid contract: 20 columns (A-T), 12 rows; named points remain aliases.
+GRID_LOCATION_IDS = [f"{chr(65 + col)}{row + 1}" for row in range(12) for col in range(20)]
+MAP_LOCATION_IDS = ["command", "village", "bridge"] + GRID_LOCATION_IDS
+MAP_UNIT_IDS = ["alpha", "bravo", "charlie"]
+
 TURN_RESPONSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -255,10 +261,10 @@ TURN_RESPONSE_SCHEMA = {
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "unit_id": {"type": "string", "enum": ["alpha"]},
+                            "unit_id": {"type": "string", "enum": MAP_UNIT_IDS},
                             "target_location_id": {
                                 "type": "string",
-                                "enum": ["command", "village", "bridge"]
+                                "enum": MAP_LOCATION_IDS
                             }
                         },
                         "required": ["unit_id", "target_location_id"]
@@ -274,7 +280,7 @@ TURN_RESPONSE_SCHEMA = {
                 "summary": {"type": "string"},
                 "unit_location_id": {
                     "type": "string",
-                    "enum": ["command", "village", "bridge"]
+                    "enum": MAP_LOCATION_IDS
                 },
                 "civilian_risk": {"type": "string"},
                 "threat_assessment": {"type": "string"}
@@ -322,8 +328,17 @@ human authorization. Autonomous systems can observe or classify, but cannot inde
 authorize escalation or lethal force. Do not invent capabilities or map identifiers.
 
 Return only the requested JSON schema. map_actions are proposed game actions, not proof that
-the action happened. Only use the supported map unit alpha and locations command, village,
-or bridge. If the action is unsafe, unauthorized, or unsupported, do not emit a map action;
+the action happened. Supported units: alpha (Hungarian infantry squad), bravo (Lynx KF41 HU infantry
+fighting vehicle), charlie (Leopard 2A7HU tank). Always preserve the unit_id selected by
+the player; do not substitute alpha for bravo or charlie. This is a fictional training
+map with 20 columns A-T and 12 rows 1-12. Any grid cell is an available destination:
+A1 through T12. Named aliases: command=D10, village=J4, bridge=P9. Grid coordinates
+have column A at the left and row 1 at the top. A cell center in map pixels is
+x=column_index*50+25, y=row_index*50+25. The visual terrain has no movement-cost or
+impassable-cell mechanic in this version: ordinary player movement to any valid cell
+is supported, including water and mountain cells. This does not authorize escalation.
+For a supported ordinary move emit move_unit with exactly the requested unit_id and
+target_location_id; preserve ethical adjudication for actions involving scenario risks. If the action is unsafe, unauthorized, or unsupported, do not emit a map action;
 explain the consequence in narrative and assessment. Never claim that a unit has arrived
 until the map service produces the corresponding event.
 """
@@ -446,7 +461,7 @@ def _map_session_events(session_id: str):
 
 def _default_game_state(scenario_id: str):
     return {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "turn": 1,
         "units": {
             "alpha": {
@@ -454,7 +469,15 @@ def _default_game_state(scenario_id: str):
                 "side": "friendly",
                 "status": "ready",
                 "location_id": "command",
-                "position": {"x": 170, "y": 395}
+                "position": {"x": 175, "y": 475}
+            },
+            "bravo": {
+                "label": "Bravo", "side": "friendly", "status": "ready",
+                "location_id": "E11", "position": {"x": 225, "y": 525}
+            },
+            "charlie": {
+                "label": "Charlie", "side": "friendly", "status": "ready",
+                "location_id": "C11", "position": {"x": 125, "y": 525}
             }
         },
         "last_event": None,
@@ -495,16 +518,16 @@ def _validate_map_actions(actions):
             rejected.append({"action": action, "reason": "unsupported_action"})
             continue
         payload = action.get("payload") or {}
-        if payload.get("unit_id") != "alpha":
+        if payload.get("unit_id") not in MAP_UNIT_IDS:
             rejected.append({"action": action, "reason": "unsupported_unit_id"})
             continue
-        if payload.get("target_location_id") not in {"command", "village", "bridge"}:
+        if payload.get("target_location_id") not in MAP_LOCATION_IDS:
             rejected.append({"action": action, "reason": "unsupported_location_id"})
             continue
         validated.append({
             "type": "move_unit",
             "payload": {
-                "unit_id": "alpha",
+                "unit_id": payload["unit_id"],
                 "target_location_id": payload["target_location_id"]
             }
         })
@@ -581,7 +604,7 @@ def _persist_turn_to_map(
 ):
     now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
     next_state = json.loads(json.dumps(current_state))
-    next_state["schema_version"] = "2.0"
+    next_state["schema_version"] = "3.0"
     next_state["turn"] = int(next_state.get("turn", 1)) + 1
     engine = _engine_state(next_state, current_state.get("engine", {}).get("scenario_id", ""))
     response_record = {
@@ -780,6 +803,10 @@ def resolve_turn(turn: TurnRequest, request: Request):
 
     if persisted_state is None:
         persisted_state = json.loads(json.dumps(turn.game_state or _default_game_state(selected_id)))
+    defaults = _default_game_state(selected_id)["units"]
+    units = persisted_state.setdefault("units", {})
+    for unit_id, unit in defaults.items():
+        units.setdefault(unit_id, unit)
     engine = _engine_state(persisted_state, selected_id)
     if turn.turn_id and engine.get("last_turn_id") == turn.turn_id and engine.get("last_response"):
         return {
@@ -809,6 +836,9 @@ def resolve_turn(turn: TurnRequest, request: Request):
         "scenario_id": selected_id,
         "scenario": scenario,
         "player_action": turn.player_action,
+        "map_grid": {"columns": 20, "rows": 12, "cell_size": 50,
+                     "named_cells": {"command": "D10", "village": "J4", "bridge": "P9"},
+                     "unit_ids": MAP_UNIT_IDS},
         "game_state": persisted_state,
         "recent_events": (persisted_events[-20:] if persisted_snapshot else turn.recent_events[-20:]),
         "state_summary": engine.get("summary") or turn.state_summary
@@ -928,3 +958,4 @@ def append_log(log: DecisionLog):
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"status": "logged", "path": path}
+
