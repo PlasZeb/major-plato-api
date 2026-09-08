@@ -164,7 +164,7 @@ def health():
     return {
         "ok": True,
         "scenario_count": len(SCENARIOS),
-        "grid_version": "3.0"
+        "grid_version": "3.1"
     }
 
 
@@ -232,8 +232,8 @@ class TurnRequest(BaseModel):
 
 # Shared grid contract: 20 columns (A-T), 12 rows; named points remain aliases.
 GRID_LOCATION_IDS = [f"{chr(65 + col)}{row + 1}" for row in range(12) for col in range(20)]
-MAP_LOCATION_IDS = ["command", "village", "bridge"] + GRID_LOCATION_IDS
-MAP_UNIT_IDS = ["alpha", "bravo", "charlie"]
+MAP_LOCATION_IDS = ["command", "village", "bridge", "mosque", "factory"] + GRID_LOCATION_IDS
+MAP_UNIT_IDS = ["alpha", "bravo", "charlie", "delta", "echo"]
 
 TURN_RESPONSE_SCHEMA = {
     "type": "object",
@@ -329,10 +329,10 @@ authorize escalation or lethal force. Do not invent capabilities or map identifi
 
 Return only the requested JSON schema. map_actions are proposed game actions, not proof that
 the action happened. Supported units: alpha (Hungarian infantry squad), bravo (Lynx KF41 HU infantry
-fighting vehicle), charlie (Leopard 2A7HU tank). Always preserve the unit_id selected by
+fighting vehicle), charlie (Leopard 2A7HU tank), delta (unarmed reconnaissance drone), echo (H145M utility helicopter). Always preserve the unit_id selected by
 the player; do not substitute alpha for bravo or charlie. This is a fictional training
 map with 20 columns A-T and 12 rows 1-12. Any grid cell is an available destination:
-A1 through T12. Named aliases: command=D10, village=J4, bridge=P9. Grid coordinates
+A1 through T12. Named aliases: command=D10, village=J4, bridge=P9, mosque=M4, factory=D6. The mosque is outside the village, separated by open ground; the factory is in open fields. Both are civilian landmarks. Their presence alone provides no evidence of hostile use. The drone is unarmed; adding an aircraft does not create autonomous attack authority. Grid coordinates
 have column A at the left and row 1 at the top. A cell center in map pixels is
 x=column_index*50+25, y=row_index*50+25. The visual terrain has no movement-cost or
 impassable-cell mechanic in this version: ordinary player movement to any valid cell
@@ -461,7 +461,7 @@ def _map_session_events(session_id: str):
 
 def _default_game_state(scenario_id: str):
     return {
-        "schema_version": "3.0",
+        "schema_version": "3.1",
         "turn": 1,
         "units": {
             "alpha": {
@@ -478,6 +478,14 @@ def _default_game_state(scenario_id: str):
             "charlie": {
                 "label": "Charlie", "side": "friendly", "status": "ready",
                 "location_id": "C11", "position": {"x": 125, "y": 525}
+            },
+            "delta": {
+                "label": "Delta", "equipment": "Felderítő drón", "side": "friendly", "status": "ready",
+                "location_id": "F11", "position": {"x": 275, "y": 525}
+            },
+            "echo": {
+                "label": "Echo", "equipment": "H145M helikopter", "side": "friendly", "status": "ready",
+                "location_id": "G11", "position": {"x": 325, "y": 525}
             }
         },
         "last_event": None,
@@ -604,7 +612,7 @@ def _persist_turn_to_map(
 ):
     now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
     next_state = json.loads(json.dumps(current_state))
-    next_state["schema_version"] = "3.0"
+    next_state["schema_version"] = "3.1"
     next_state["turn"] = int(next_state.get("turn", 1)) + 1
     engine = _engine_state(next_state, current_state.get("engine", {}).get("scenario_id", ""))
     response_record = {
@@ -837,7 +845,7 @@ def resolve_turn(turn: TurnRequest, request: Request):
         "scenario": scenario,
         "player_action": turn.player_action,
         "map_grid": {"columns": 20, "rows": 12, "cell_size": 50,
-                     "named_cells": {"command": "D10", "village": "J4", "bridge": "P9"},
+                     "named_cells": {"command": "D10", "village": "J4", "bridge": "P9", "mosque": "M4", "factory": "D6"},
                      "unit_ids": MAP_UNIT_IDS},
         "game_state": persisted_state,
         "recent_events": (persisted_events[-20:] if persisted_snapshot else turn.recent_events[-20:]),
