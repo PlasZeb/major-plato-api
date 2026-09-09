@@ -232,7 +232,7 @@ class TurnRequest(BaseModel):
     expected_turn: Optional[int] = None
 
 
-# Shared grid contract: 20 columns (A-T), 12 rows; named points remain aliases.
+# Legacy grid metadata retained for backward compatibility only; it is not an authorization whitelist.
 GRID_LOCATION_IDS = [f"{chr(65 + col)}{row + 1}" for row in range(12) for col in range(20)]
 MAP_LOCATION_IDS = ["command", "village", "bridge", "mosque", "factory"] + GRID_LOCATION_IDS
 MAP_UNIT_IDS = ["alpha", "bravo", "charlie", "delta", "echo"]
@@ -263,11 +263,8 @@ TURN_RESPONSE_SCHEMA = {
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "unit_id": {"type": "string", "enum": MAP_UNIT_IDS},
-                            "target_location_id": {
-                                "type": "string",
-                                "enum": MAP_LOCATION_IDS
-                            }
+                            "unit_id": {"type": "string", "minLength": 1},
+                            "target_location_id": {"type": "string", "minLength": 1}
                         },
                         "required": ["unit_id", "target_location_id"]
                     }
@@ -282,7 +279,7 @@ TURN_RESPONSE_SCHEMA = {
                 "summary": {"type": "string"},
                 "unit_location_id": {
                     "type": "string",
-                    "enum": MAP_LOCATION_IDS
+                    "minLength": 1
                 },
                 "civilian_risk": {"type": "string"},
                 "threat_assessment": {"type": "string"}
@@ -344,19 +341,24 @@ Use the server-supplied scoring_rubric for score_delta. If absent, return null f
 Never derive a scoring rubric or initial scores from a player instruction. The assessment
 contains your concise instructor-facing reasons, not hidden chain-of-thought.
 Return only the requested JSON schema. map_actions are proposed game actions, not proof that
-the action happened. Supported units: alpha (Hungarian infantry squad), bravo (Lynx KF41 HU infantry
-fighting vehicle), charlie (Leopard 2A7HU tank), delta (unarmed reconnaissance drone), echo (H145M utility helicopter). Always preserve the unit_id selected by
-the player; do not substitute alpha for bravo or charlie. This is a fictional training
-map with 20 columns A-T and 12 rows 1-12. Any grid cell is an available destination:
-A1 through T12. Named aliases: command=D10, village=J4, bridge=P9, mosque=M4, factory=D6. The mosque is outside the village, separated by open ground; the factory is in open fields. Both are civilian landmarks. Their presence alone provides no evidence of hostile use. The drone is unarmed; adding an aircraft does not create autonomous attack authority. Grid coordinates
-have column A at the left and row 1 at the top. A cell center in map pixels is
-x=column_index*50+25, y=row_index*50+25. The visual terrain has no movement-cost or
-impassable-cell mechanic in this version: ordinary player movement to any valid cell
-is supported, including water and mountain cells. This does not authorize escalation.
-For a supported ordinary move emit move_unit with exactly the requested unit_id and
-target_location_id; preserve ethical adjudication for actions involving scenario risks. If the action is unsafe, unauthorized, or unsupported, do not emit a map action;
-explain the consequence in narrative and assessment. Never claim that a unit has arrived
-until the map service produces the corresponding event.
+the action happened.
+
+Map unit IDs and location IDs are dynamic. Use only identifiers present in the supplied
+current game state, scenario data, or authoritative map events. Do not invent identifiers
+and do not substitute one unit for another. A unit or location introduced by authoritative
+session state or map events is valid even if it did not exist at scenario initialization.
+
+Do not infer capabilities from an identifier. Use equipment, side, status, capabilities,
+and other metadata only when supplied by authoritative scenario, state, or event data.
+
+For an ordinary supported movement request, emit move_unit with exactly the requested
+unit_id and target_location_id. If an identifier is not established by authoritative
+state, do not manufacture it. If an action is unsafe or unauthorized, preserve the ethical
+and operational adjudication and do not emit an unsupported map action.
+
+map_actions represent requested actions only. Never claim that movement succeeded or that
+a unit arrived until the map service confirms the action or produces the corresponding
+authoritative event.
 """
 
 
@@ -540,27 +542,83 @@ def _engine_state(game_state: Dict[str, Any], scenario_id: str):
     return engine
 
 
-def _validate_map_actions(actions):
+def _known_location_ids(game_state: Dict[str, Any], scenario: Optional[Dict[str, Any]] = None):
+    known = set()
+    state = game_state if isinstance(game_state, dict) else {}
+
+    locations = state.get("locations")
+    if isinstance(locations, dict):
+        known.update(str(k) for k in locations.keys() if k)
+    elif isinstance(locations, list):
+        for item in locations:
+            if isinstance(item, str) and item:
+                known.add(item)
+            elif isinstance(item, dict):
+                location_id = item.get("id") or item.get("location_id")
+                if isinstance(location_id, str) and location_id:
+                    known.add(location_id)
+
+    units = state.get("units")
+    if isinstance(units, dict):
+        for unit in units.values():
+            if isinstance(unit, dict):
+                location_id = unit.get("location_id")
+                if isinstance(location_id, str) and location_id:
+                    known.add(location_id)
+
+    scenario_content = (scenario or {}).get("content", scenario or {})
+    if isinstance(scenario_content, dict):
+        map_data = scenario_content.get("map")
+        if isinstance(map_data, dict):
+            for key in ("available_location_ids", "location_ids"):
+                values = map_data.get(key)
+                if isinstance(values, list):
+                    known.update(str(v) for v in values if isinstance(v, str) and v)
+            for key in ("initial_location_id",):
+                value = map_data.get(key)
+                if isinstance(value, str) and value:
+                    known.add(value)
+
+    return known
+
+
+def _validate_map_actions(actions, game_state: Dict[str, Any], scenario: Optional[Dict[str, Any]] = None):
     validated = []
     rejected = []
+    state = game_state if isinstance(game_state, dict) else {}
+    units = state.get("units")
+    valid_unit_ids = set(units.keys()) if isinstance(units, dict) else set()
+    valid_location_ids = _known_location_ids(state, scenario)
+
     for action in actions or []:
         if not isinstance(action, dict) or action.get("type") != "move_unit":
             rejected.append({"action": action, "reason": "unsupported_action"})
             continue
-        payload = action.get("payload") or {}
-        if payload.get("unit_id") not in MAP_UNIT_IDS:
-            rejected.append({"action": action, "reason": "unsupported_unit_id"})
+
+        payload = action.get("payload")
+        if not isinstance(payload, dict):
+            rejected.append({"action": action, "reason": "invalid_payload"})
             continue
-        if payload.get("target_location_id") not in MAP_LOCATION_IDS:
-            rejected.append({"action": action, "reason": "unsupported_location_id"})
+
+        unit_id = payload.get("unit_id")
+        target_location_id = payload.get("target_location_id")
+
+        if not isinstance(unit_id, str) or not unit_id or unit_id not in valid_unit_ids:
+            rejected.append({"action": action, "reason": "UNKNOWN_UNIT"})
             continue
+        if (not isinstance(target_location_id, str) or not target_location_id
+                or target_location_id not in valid_location_ids):
+            rejected.append({"action": action, "reason": "UNKNOWN_LOCATION"})
+            continue
+
         validated.append({
             "type": "move_unit",
             "payload": {
-                "unit_id": payload["unit_id"],
-                "target_location_id": payload["target_location_id"]
+                "unit_id": unit_id,
+                "target_location_id": target_location_id
             }
         })
+
     return validated, rejected
 
 
@@ -831,10 +889,10 @@ def _resolve_turn_impl(turn: TurnRequest, request: Request, archive_context):
 
     if persisted_state is None:
         persisted_state = json.loads(json.dumps(turn.game_state or _default_game_state(selected_id)))
-    defaults = _default_game_state(selected_id)["units"]
-    units = persisted_state.setdefault("units", {})
-    for unit_id, unit in defaults.items():
-        units.setdefault(unit_id, unit)
+    # A persisted map session is authoritative. Do not inject legacy default units into it.
+    # Stateless callers still receive _default_game_state() above when they provide no state.
+    if not isinstance(persisted_state.get("units"), dict):
+        persisted_state["units"] = {}
     engine = _engine_state(persisted_state, selected_id)
     archive_session_id = map_session_id or ("stateless:" + turn.session_id)
     actual_turn_id = turn.turn_id or (f"map-turn-{persisted_state.get('turn', 1)}" if map_session_id else None)
@@ -880,9 +938,15 @@ def _resolve_turn_impl(turn: TurnRequest, request: Request, archive_context):
         "scenario": scenario,
         "scoring_rubric": archived.get("rubric"),
         "player_action": turn.player_action,
-        "map_grid": {"columns": 20, "rows": 12, "cell_size": 50,
-                     "named_cells": {"command": "D10", "village": "J4", "bridge": "P9", "mosque": "M4", "factory": "D6"},
-                     "unit_ids": MAP_UNIT_IDS},
+        "map_grid": {
+            "columns": 20,
+            "rows": 12,
+            "cell_size": 50,
+            "legacy_named_cells": {
+                "command": "D10", "village": "J4", "bridge": "P9",
+                "mosque": "M4", "factory": "D6"
+            }
+        },
         "game_state": persisted_state,
         "recent_events": (persisted_events[-20:] if persisted_snapshot else turn.recent_events[-20:]),
         "state_summary": engine.get("summary") or turn.state_summary
@@ -903,7 +967,9 @@ def _resolve_turn_impl(turn: TurnRequest, request: Request, archive_context):
     model_turn = public(model_turn)
     persisted_state = public(persisted_state)
     validated_actions, rejected_actions = _validate_map_actions(
-        model_turn.get("map_actions", [])
+        model_turn.get("map_actions", []),
+        persisted_state,
+        scenario
     )
     if map_session_id:
         dispatch = _dispatch_map_actions(map_session_id, validated_actions)
