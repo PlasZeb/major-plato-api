@@ -95,3 +95,9 @@ Example turn:
 ```
 
 Do not put OPENAI_API_KEY, MAP_API_KEY, or GitHub tokens in source control or browser code.
+
+
+## Private instructor archive
+
+Automatic `/turn` logging and backwards-compatible `/append_log` exports now use the private GitHub log repository. See [INSTRUCTOR_LOGGING.md](INSTRUCTOR_LOGGING.md) for access, CSV/JSON exports, scoring rubric setup, duplicate handling, and recovery limits. Required: server-side `GITHUB_TOKEN`; `LOG_REPO` defaults to `PlasZeb/major-plato-logs`. Missing numeric scoring is explicitly ungraded until the instructor's actual rubric is configured.
+
